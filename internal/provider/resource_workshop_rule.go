@@ -29,6 +29,7 @@ var _ resource.Resource = &RuleResource{}
 var _ resource.ResourceWithConfigure = &RuleResource{}
 var _ resource.ResourceWithImportState = &RuleResource{}
 var _ resource.ResourceWithIdentity = &RuleResource{}
+var _ resource.ResourceWithModifyPlan = &RuleResource{}
 var _ list.ListResource = &RuleResource{}
 var _ list.ListResourceWithConfigure = &RuleResource{}
 
@@ -100,9 +101,10 @@ func (r *RuleResource) Schema(ctx context.Context, req resource.SchemaRequest, r
 				},
 			},
 			"block_reason": schema.StringAttribute{
-				Description:         "The block reason for this rule. The possible values are: POLICY and MALICIOUS.",
-				MarkdownDescription: "The block reason for this rule. The possible values are: `POLICY`, and `MALICIOUS`.",
+				Description:         "The block reason for this rule. The possible values are BLOCK_REASON_POLICY and BLOCK_REASON_MALICIOUS. When omitted for a blocking rule, Workshop's default is recorded in state.",
+				MarkdownDescription: "The block reason for this rule. The possible values are `BLOCK_REASON_POLICY` and `BLOCK_REASON_MALICIOUS`. When omitted for a blocking rule, Workshop's default is recorded in state.",
 				Optional:            true,
+				Computed:            true,
 				Validators: []validator.String{
 					stringvalidator.OneOf(utils.ProtoEnumToList(apipb.Rule_BlockReason(0).Descriptor())...),
 				},
@@ -220,6 +222,46 @@ func (r *RuleResource) Configure(ctx context.Context, req resource.ConfigureRequ
 	r.client = pd.Client
 }
 
+func plannedRuleBlockReason(policy, configured types.String) types.String {
+	if !configured.IsNull() {
+		return configured
+	}
+	switch policy.ValueString() {
+	case "BLOCKLIST", "SILENT_BLOCKLIST":
+		return types.StringValue(apipb.Rule_BLOCK_REASON_POLICY.String())
+	default:
+		return types.StringNull()
+	}
+}
+
+func (r *RuleResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var config, plan RuleResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// The API defaults omitted blocking reasons to POLICY. Make that value
+	// explicit in the plan so Create never returns an unknown computed value,
+	// imports converge, and changing to a non-blocking policy clears it.
+	if config.BlockReason.IsNull() && !plan.Policy.IsNull() && !plan.Policy.IsUnknown() {
+		plan.BlockReason = plannedRuleBlockReason(plan.Policy, config.BlockReason)
+		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+	}
+}
+
+func applyRuleBlockReason(rule *apipb.Rule, blockReason types.String) {
+	if blockReason.IsNull() || blockReason.IsUnknown() {
+		return
+	}
+	rule.SetBlockReason(apipb.Rule_BlockReason(apipb.Rule_BlockReason_value[blockReason.ValueString()]))
+}
+
 func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var data RuleResourceModel
 
@@ -243,6 +285,7 @@ func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, r
 		CustomUrl:  data.CustomURL.ValueString(),
 		CelExpr:    data.CELExpr.ValueString(),
 	}.Build()
+	applyRuleBlockReason(rule, data.BlockReason)
 
 	createReq := apipb.CreateRuleRequest_builder{
 		Rule: rule,
@@ -308,6 +351,7 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
 	rule := ret.GetRules()[0]
+	data.BlockReason = types.StringNull()
 	data.Id = types.StringValue(rule.GetRuleId())
 	data.Identifier = types.StringValue(rule.GetIdentifier())
 	data.RuleType = types.StringValue(rule.GetRuleType().String())
