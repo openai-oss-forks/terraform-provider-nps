@@ -41,7 +41,8 @@ func NewPackageRuleResource() resource.Resource {
 
 // PackageRuleResource defines the resource implementation.
 type PackageRuleResource struct {
-	client svcpb.WorkshopServiceClient
+	client               svcpb.WorkshopServiceClient
+	deleteExecutionRules bool
 }
 
 // PackageRuleIdentityModel describes the identity data model.
@@ -69,8 +70,8 @@ func (r *PackageRuleResource) Metadata(ctx context.Context, req resource.Metadat
 
 func (r *PackageRuleResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description:         "The nps_workshop_package_rule resource manages Package Rules. Package rules sync identifiers from GAL for a package. Management of package rules requires the read:rules and write:rules permissions.",
-		MarkdownDescription: "The `nps_workshop_package_rule` resource manages Package Rules.\n\nPackage rules sync identifiers from GAL for a package.\n\nManagement of package rules requires the `read:rules` and `write:rules` permissions.",
+		Description:         "The nps_workshop_package_rule resource manages Package Rules. Package rules sync identifiers from GAL for a package. By default, deleting a package rule retains its generated execution rules; set the provider's delete_package_execution_rules option to true to delete them together. Management of package rules requires the read:rules and write:rules permissions.",
+		MarkdownDescription: "The `nps_workshop_package_rule` resource manages Package Rules.\n\nPackage rules sync identifiers from GAL for a package. By default, deleting a package rule retains its generated execution rules; set the provider's `delete_package_execution_rules` option to `true` to delete them together.\n\nManagement of package rules requires the `read:rules` and `write:rules` permissions.",
 
 		Attributes: map[string]schema.Attribute{
 			"tag": schema.StringAttribute{
@@ -150,6 +151,7 @@ func (r *PackageRuleResource) Configure(ctx context.Context, req resource.Config
 		return
 	}
 	r.client = pd.Client
+	r.deleteExecutionRules = pd.DeletePackageExecutionRules
 }
 
 func (r *PackageRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -281,6 +283,13 @@ func (r *PackageRuleResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.AddError("Client Error", "nps_workshop_package_rule does not support in-place updates")
 }
 
+func packageRuleDeleteRequest(id int64, deleteExecutionRules bool) *apipb.DeletePackageRuleRequest {
+	return apipb.DeletePackageRuleRequest_builder{
+		RuleId:               proto.Int64(id),
+		DeleteExecutionRules: proto.Bool(deleteExecutionRules),
+	}.Build()
+}
+
 func (r *PackageRuleResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var data PackageRuleResourceModel
 
@@ -293,9 +302,7 @@ func (r *PackageRuleResource) Delete(ctx context.Context, req resource.DeleteReq
 	}
 
 	ruleId := data.Id.ValueInt64()
-	_, err := r.client.DeletePackageRule(ctx, apipb.DeletePackageRuleRequest_builder{
-		RuleId: proto.Int64(ruleId),
-	}.Build())
+	_, err := r.client.DeletePackageRule(ctx, packageRuleDeleteRequest(ruleId, r.deleteExecutionRules))
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete package rule: %v", err))
 		return

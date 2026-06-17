@@ -5,6 +5,7 @@ subcategory: ""
 description: |-
   The nps_workshop_package_rule resource manages Package Rules.
   Package rules sync identifiers from GAL for a package.
+  By default, deleting a package rule retains its generated execution rules; set the provider's delete_package_execution_rules option to true to delete them together.
   Management of package rules requires the read:rules and write:rules permissions.
 ---
 
@@ -13,6 +14,8 @@ description: |-
 The `nps_workshop_package_rule` resource manages Package Rules.
 
 Package rules sync identifiers from GAL for a package.
+
+By default, deleting a package rule retains its generated execution rules; set the provider's `delete_package_execution_rules` option to `true` to delete them together.
 
 Management of package rules requires the `read:rules` and `write:rules` permissions.
 

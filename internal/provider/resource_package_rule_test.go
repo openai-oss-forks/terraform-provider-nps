@@ -5,8 +5,30 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
+
+func TestConfiguredDeletePackageExecutionRulesDefaultsFalse(t *testing.T) {
+	if configuredDeletePackageExecutionRules(types.BoolNull()) {
+		t.Fatal("null provider setting should default to false")
+	}
+	if !configuredDeletePackageExecutionRules(types.BoolValue(true)) {
+		t.Fatal("explicit true provider setting should be preserved")
+	}
+}
+
+func TestPackageRuleDeleteRequestUsesProviderSetting(t *testing.T) {
+	for _, deleteChildren := range []bool{false, true} {
+		req := packageRuleDeleteRequest(42, deleteChildren)
+		if got := req.GetRuleId(); got != 42 {
+			t.Fatalf("rule ID = %d, want 42", got)
+		}
+		if got := req.GetDeleteExecutionRules(); got != deleteChildren {
+			t.Fatalf("DeleteExecutionRules = %v, want %v", got, deleteChildren)
+		}
+	}
+}
 
 func TestAccPackageRule(t *testing.T) {
 	resource.Test(t, resource.TestCase{
