@@ -7,17 +7,18 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int32validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/list"
 	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/northpolesec/terraform-provider-nps/internal/utils"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	svcpb "buf.build/gen/go/northpolesec/workshop-api/grpc/go/workshop/v1/workshopv1grpc"
@@ -70,6 +71,7 @@ type RuleAffectedHostThresholdModel struct {
 
 func (r *RuleResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_workshop_rule"
+	resp.ResourceBehavior = resource.ResourceBehavior{MutableIdentity: true}
 }
 
 func (r *RuleResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
@@ -135,9 +137,6 @@ func (r *RuleResource) Schema(ctx context.Context, req resource.SchemaRequest, r
 			"id": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The automatically generated ID of this rule",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
 			},
 		},
 
@@ -220,16 +219,10 @@ func (r *RuleResource) Configure(ctx context.Context, req resource.ConfigureRequ
 	r.client = pd.Client
 }
 
-func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var data RuleResourceModel
-
-	// Read Terraform plan data into the model
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
-
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
+// upsert creates or updates a rule using Workshop's CreateRule upsert
+// semantics. Workshop can return a new rule ID when an existing rule changes,
+// so the returned ID must always replace the prior Terraform state value.
+func (r *RuleResource) upsert(ctx context.Context, data *RuleResourceModel, diags *diag.Diagnostics) {
 	ruleType := apipb.RuleType_value[data.RuleType.ValueString()]
 	rulePolicy := apipb.Policy_value[data.Policy.ValueString()]
 
@@ -260,11 +253,33 @@ func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, r
 
 	crResp, err := r.client.CreateRule(ctx, createReq.Build())
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to create rule: %v", err))
+		diags.AddError("Client Error", fmt.Sprintf("Failed to upsert rule: %v", err))
+		return
+	}
+	data.Id = types.StringValue(crResp.GetRuleId())
+}
+
+func (r *RuleResource) delete(ctx context.Context, id string) error {
+	_, err := r.client.DeleteRule(ctx, apipb.DeleteRuleRequest_builder{
+		RuleId: proto.String(id),
+	}.Build())
+	return err
+}
+
+func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var data RuleResourceModel
+
+	// Read Terraform plan data into the model
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	data.Id = types.StringValue(crResp.GetRuleId())
+	r.upsert(ctx, &data, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Set the identity
 	resp.Diagnostics.Append(resp.Identity.Set(ctx, RuleIdentityModel{Id: data.Id})...)
@@ -338,9 +353,34 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 }
 
 func (r *RuleResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	// Because an "upsert" of a rule results in a new rule ID, it's not possible
-	// for us to implement in-place updates.
-	resp.Diagnostics.AddError("Client Error", "nps_workshop_rule does not support in-place updates")
+	var plan, state RuleResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	r.upsert(ctx, &plan, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// CreateRule replaces a matching rule server-side. If an identity field
+	// changed, however, it creates a distinct rule; remove the prior rule only
+	// after the new rule exists to avoid an enforcement gap.
+	oldID := state.Id.ValueString()
+	identityChanged := state.Identifier.ValueString() != plan.Identifier.ValueString() ||
+		state.RuleType.ValueString() != plan.RuleType.ValueString() ||
+		state.Tag.ValueString() != plan.Tag.ValueString()
+	if identityChanged && oldID != "" && oldID != plan.Id.ValueString() {
+		if err := r.delete(ctx, oldID); err != nil && status.Code(err) != codes.NotFound {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete prior rule %q after replacement: %v", oldID, err))
+			return
+		}
+	}
+
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, RuleIdentityModel{Id: plan.Id})...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *RuleResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -354,9 +394,7 @@ func (r *RuleResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 		return
 	}
 
-	_, err := r.client.DeleteRule(ctx, apipb.DeleteRuleRequest_builder{
-		RuleId: proto.String(data.Id.ValueString()),
-	}.Build())
+	err := r.delete(ctx, data.Id.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete rule: %v", err))
 		return

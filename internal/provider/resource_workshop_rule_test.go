@@ -2,11 +2,21 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
+	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
+
+func TestRuleResourceAllowsMutableIdentity(t *testing.T) {
+	var resp frameworkresource.MetadataResponse
+	(&RuleResource{}).Metadata(context.Background(), frameworkresource.MetadataRequest{}, &resp)
+	if !resp.ResourceBehavior.MutableIdentity {
+		t.Fatal("RuleResource must allow Workshop to return a new identity during upsert")
+	}
+}
 
 func TestAccWorkshopRule(t *testing.T) {
 	resource.Test(t, resource.TestCase{
