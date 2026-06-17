@@ -57,6 +57,7 @@ func (r *TagOrderResource) Schema(ctx context.Context, req resource.SchemaReques
 				ElementType:         types.StringType,
 				Validators: []validator.List{
 					listvalidator.UniqueValues(),
+					listvalidator.SizeAtMost(25),
 				},
 			},
 		},

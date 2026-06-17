@@ -8,6 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/list"
 	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -15,8 +16,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -236,9 +235,6 @@ func (r *FileAccessRuleResource) Schema(ctx context.Context, req resource.Schema
 			"id": schema.Int64Attribute{
 				Computed:            true,
 				MarkdownDescription: "The automatically generated ID of this file access rule",
-				PlanModifiers: []planmodifier.Int64{
-					int64planmodifier.RequiresReplace(),
-				},
 			},
 		},
 	}
@@ -261,17 +257,10 @@ func (r *FileAccessRuleResource) Configure(ctx context.Context, req resource.Con
 	r.client = pd.Client
 }
 
-func (r *FileAccessRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var data FileAccessRuleResourceModel
-
-	// Read Terraform plan data into the model
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
-
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	// Convert rule type string to enum
+// upsert creates or updates a file access rule. Workshop treats name and tag
+// as the resource identity and returns the current rule ID, which can change
+// when an existing rule is updated.
+func (r *FileAccessRuleResource) upsert(ctx context.Context, data *FileAccessRuleResourceModel, diags *diag.Diagnostics) {
 	ruleType := apipb.FileAccessRuleType_FILE_ACCESS_RULE_TYPE_UNSPECIFIED
 	switch data.RuleType.ValueString() {
 	case "PathsWithAllowedProcesses":
@@ -284,7 +273,6 @@ func (r *FileAccessRuleResource) Create(ctx context.Context, req resource.Create
 		ruleType = apipb.FileAccessRuleType_FILE_ACCESS_RULE_TYPE_PROCESSES_WITH_DENIED_PATHS
 	}
 
-	// Build the file access rule
 	builder := apipb.FileAccessRule_builder{
 		Tag:                 data.Tag.ValueString(),
 		Name:                data.Name.ValueString(),
@@ -298,22 +286,20 @@ func (r *FileAccessRuleResource) Create(ctx context.Context, req resource.Create
 		EventDetailText:     data.EventDetailText.ValueString(),
 	}
 
-	// Convert list attributes to string slices
-	convertListHelper := func(v types.List, target *[]string) {
+	convertList := func(v types.List, target *[]string) {
 		if v.IsNull() || v.IsUnknown() {
 			return
 		}
-		resp.Diagnostics.Append(v.ElementsAs(ctx, target, false)...)
+		diags.Append(v.ElementsAs(ctx, target, false)...)
 	}
-	convertListHelper(data.PathLiterals, &builder.PathLiterals)
-	convertListHelper(data.PathPrefixes, &builder.PathPrefixes)
-	convertListHelper(data.ProcessBinaryPaths, &builder.ProcessBinaryPaths)
-	convertListHelper(data.ProcessCdHashes, &builder.ProcessCdHashes)
-	convertListHelper(data.ProcessSigningIds, &builder.ProcessSigningIds)
-	convertListHelper(data.ProcessCertificateSha256s, &builder.ProcessCertificateSha256S)
-	convertListHelper(data.ProcessTeamIds, &builder.ProcessTeamIds)
-
-	if resp.Diagnostics.HasError() {
+	convertList(data.PathLiterals, &builder.PathLiterals)
+	convertList(data.PathPrefixes, &builder.PathPrefixes)
+	convertList(data.ProcessBinaryPaths, &builder.ProcessBinaryPaths)
+	convertList(data.ProcessCdHashes, &builder.ProcessCdHashes)
+	convertList(data.ProcessSigningIds, &builder.ProcessSigningIds)
+	convertList(data.ProcessCertificateSha256s, &builder.ProcessCertificateSha256S)
+	convertList(data.ProcessTeamIds, &builder.ProcessTeamIds)
+	if diags.HasError() {
 		return
 	}
 
@@ -321,11 +307,33 @@ func (r *FileAccessRuleResource) Create(ctx context.Context, req resource.Create
 		Rule: builder.Build(),
 	}.Build())
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to create file access rule: %v", err))
+		diags.AddError("Client Error", fmt.Sprintf("Failed to upsert file access rule: %v", err))
+		return
+	}
+	data.Id = types.Int64Value(crResp.GetRuleId())
+}
+
+func (r *FileAccessRuleResource) delete(ctx context.Context, id int64) error {
+	_, err := r.client.DeleteFileAccessRule(ctx, apipb.DeleteFileAccessRuleRequest_builder{
+		RuleId: proto.Int64(id),
+	}.Build())
+	return err
+}
+
+func (r *FileAccessRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var data FileAccessRuleResourceModel
+
+	// Read Terraform plan data into the model
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	data.Id = types.Int64Value(crResp.GetRuleId())
+	r.upsert(ctx, &data, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	tflog.Info(ctx, fmt.Sprintf("Created file access rule: %d", data.Id.ValueInt64()))
 
 	// Set the identity
@@ -368,6 +376,16 @@ func (r *FileAccessRuleResource) Read(ctx context.Context, req resource.ReadRequ
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
 	rule := ret.GetRules()[0]
+	data.BlockMessage = types.StringNull()
+	data.EventDetailUrl = types.StringNull()
+	data.EventDetailText = types.StringNull()
+	data.PathLiterals = types.ListNull(types.StringType)
+	data.PathPrefixes = types.ListNull(types.StringType)
+	data.ProcessBinaryPaths = types.ListNull(types.StringType)
+	data.ProcessCdHashes = types.ListNull(types.StringType)
+	data.ProcessSigningIds = types.ListNull(types.StringType)
+	data.ProcessCertificateSha256s = types.ListNull(types.StringType)
+	data.ProcessTeamIds = types.ListNull(types.StringType)
 	data.Id = types.Int64Value(rule.GetRuleId())
 	data.Tag = types.StringValue(rule.GetTag())
 	data.Name = types.StringValue(rule.GetName())
@@ -418,8 +436,30 @@ func (r *FileAccessRuleResource) Read(ctx context.Context, req resource.ReadRequ
 }
 
 func (r *FileAccessRuleResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	// File access rules don't support in-place updates. Users need to delete and recreate.
-	resp.Diagnostics.AddError("Client Error", "nps_workshop_file_access_rule does not support in-place updates")
+	var plan, state FileAccessRuleResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	r.upsert(ctx, &plan, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	oldID := state.Id.ValueInt64()
+	identityChanged := state.Name.ValueString() != plan.Name.ValueString() ||
+		state.Tag.ValueString() != plan.Tag.ValueString()
+	if identityChanged && oldID != 0 && oldID != plan.Id.ValueInt64() {
+		if err := r.delete(ctx, oldID); err != nil && !isDeleteNoOp(err) {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete superseded file access rule %d: %v", oldID, err))
+			return
+		}
+	}
+
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, FileAccessRuleIdentityModel{Id: plan.Id})...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *FileAccessRuleResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -434,10 +474,8 @@ func (r *FileAccessRuleResource) Delete(ctx context.Context, req resource.Delete
 	}
 
 	ruleId := data.Id.ValueInt64()
-	_, err := r.client.DeleteFileAccessRule(ctx, apipb.DeleteFileAccessRuleRequest_builder{
-		RuleId: proto.Int64(ruleId),
-	}.Build())
-	if err != nil {
+	err := r.delete(ctx, ruleId)
+	if err != nil && !isDeleteNoOp(err) {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete file access rule: %v", err))
 		return
 	}
@@ -478,7 +516,16 @@ func (r *FileAccessRuleResource) ListResourceConfigSchema(ctx context.Context, r
 
 func (r *FileAccessRuleResource) List(ctx context.Context, req list.ListRequest, stream *list.ListResultsStream) {
 	stream.Results = func(push func(list.ListResult) bool) {
-		ret, err := r.client.ListFileAccessRules(ctx, apipb.ListFileAccessRulesRequest_builder{}.Build())
+		rules, err := collectPages(func(page int) ([]*apipb.FileAccessRule, bool, error) {
+			ret, err := r.client.ListFileAccessRules(ctx, apipb.ListFileAccessRulesRequest_builder{
+				PageSize: proto.Uint32(uint32(listPageSize)),
+				Page:     proto.Uint32(uint32(page)),
+			}.Build())
+			if err != nil {
+				return nil, false, err
+			}
+			return ret.GetRules(), ret.GetMore(), nil
+		})
 		if err != nil {
 			result := req.NewListResult(ctx)
 			result.Diagnostics.AddError("Client Error", "Failed to list file access rules: "+err.Error())
@@ -486,7 +533,7 @@ func (r *FileAccessRuleResource) List(ctx context.Context, req list.ListRequest,
 			return
 		}
 
-		for _, rule := range ret.GetRules() {
+		for _, rule := range rules {
 			result := req.NewListResult(ctx)
 			result.DisplayName = rule.GetName()
 

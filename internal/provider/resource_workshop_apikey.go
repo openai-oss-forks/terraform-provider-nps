@@ -220,7 +220,7 @@ func (r *APIKeyResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	_, err := r.client.DeleteAPIKey(ctx, apipb.DeleteAPIKeyRequest_builder{
 		Name: proto.String(data.Name.ValueString()),
 	}.Build())
-	if err != nil {
+	if err != nil && !isDeleteNoOp(err) {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete API key: %v", err))
 		return
 	}
@@ -253,7 +253,17 @@ func (r *APIKeyResource) ListResourceConfigSchema(ctx context.Context, req list.
 
 func (r *APIKeyResource) List(ctx context.Context, req list.ListRequest, stream *list.ListResultsStream) {
 	stream.Results = func(push func(list.ListResult) bool) {
-		ret, err := r.client.ListAPIKeys(ctx, apipb.ListAPIKeysRequest_builder{}.Build())
+		keys, err := collectPages(func(page int) ([]*apipb.APIKey, bool, error) {
+			ret, err := r.client.ListAPIKeys(ctx, apipb.ListAPIKeysRequest_builder{
+				PageSize: proto.Uint32(uint32(listPageSize)),
+				Page:     proto.Uint32(uint32(page)),
+			}.Build())
+			if err != nil {
+				return nil, false, err
+			}
+			values := ret.GetKeys()
+			return values, len(values) == listPageSize, nil
+		})
 		if err != nil {
 			result := req.NewListResult(ctx)
 			result.Diagnostics.AddError("Client Error", "Failed to list API keys: "+err.Error())
@@ -261,7 +271,7 @@ func (r *APIKeyResource) List(ctx context.Context, req list.ListRequest, stream 
 			return
 		}
 
-		for _, key := range ret.GetKeys() {
+		for _, key := range keys {
 			result := req.NewListResult(ctx)
 			result.DisplayName = key.GetName()
 
