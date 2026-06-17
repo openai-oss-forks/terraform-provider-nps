@@ -252,6 +252,9 @@ func (r *PackageRuleResource) Read(ctx context.Context, req resource.ReadRequest
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
 	rule := ret.GetRules()[0]
+	data.MinDate = types.StringNull()
+	data.MaxDate = types.StringNull()
+	data.VersionRegexp = types.StringNull()
 	data.Id = types.Int64Value(rule.GetRuleId())
 	data.Tag = types.StringValue(rule.GetTag())
 	data.Source = types.StringValue(rule.GetSource().String())

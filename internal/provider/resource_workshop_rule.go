@@ -308,6 +308,10 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
 	rule := ret.GetRules()[0]
+	data.Comment = types.StringNull()
+	data.CustomMsg = types.StringNull()
+	data.CustomURL = types.StringNull()
+	data.CELExpr = types.StringNull()
 	data.Id = types.StringValue(rule.GetRuleId())
 	data.Identifier = types.StringValue(rule.GetIdentifier())
 	data.RuleType = types.StringValue(rule.GetRuleType().String())

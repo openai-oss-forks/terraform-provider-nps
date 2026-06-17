@@ -368,6 +368,16 @@ func (r *FileAccessRuleResource) Read(ctx context.Context, req resource.ReadRequ
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
 	rule := ret.GetRules()[0]
+	data.BlockMessage = types.StringNull()
+	data.EventDetailUrl = types.StringNull()
+	data.EventDetailText = types.StringNull()
+	data.PathLiterals = types.ListNull(types.StringType)
+	data.PathPrefixes = types.ListNull(types.StringType)
+	data.ProcessBinaryPaths = types.ListNull(types.StringType)
+	data.ProcessCdHashes = types.ListNull(types.StringType)
+	data.ProcessSigningIds = types.ListNull(types.StringType)
+	data.ProcessCertificateSha256s = types.ListNull(types.StringType)
+	data.ProcessTeamIds = types.ListNull(types.StringType)
 	data.Id = types.Int64Value(rule.GetRuleId())
 	data.Tag = types.StringValue(rule.GetTag())
 	data.Name = types.StringValue(rule.GetName())
