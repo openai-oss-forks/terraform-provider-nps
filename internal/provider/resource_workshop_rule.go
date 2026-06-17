@@ -357,7 +357,7 @@ func (r *RuleResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	_, err := r.client.DeleteRule(ctx, apipb.DeleteRuleRequest_builder{
 		RuleId: proto.String(data.Id.ValueString()),
 	}.Build())
-	if err != nil {
+	if err != nil && !isDeleteNoOp(err) {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to delete rule: %v", err))
 		return
 	}
