@@ -405,6 +405,85 @@ func buildCreateRuleRequest(data RuleResourceModel) *apipb.CreateRuleRequest {
 	return createReq.Build()
 }
 
+const ruleReadCandidateLimit int32 = 1000
+
+func isManagedRule(rule *apipb.Rule) bool {
+	return rule != nil && rule.GetPolicy() != apipb.Policy_REMOVE
+}
+
+func filterManagedRules(rules []*apipb.Rule) []*apipb.Rule {
+	managed := make([]*apipb.Rule, 0, len(rules))
+	for _, rule := range rules {
+		if isManagedRule(rule) {
+			managed = append(managed, rule)
+		}
+	}
+	return managed
+}
+
+func ruleMatchesLogicalIdentity(data RuleResourceModel, rule *apipb.Rule) bool {
+	if rule == nil ||
+		data.Identifier.IsNull() || data.Identifier.IsUnknown() ||
+		data.RuleType.IsNull() || data.RuleType.IsUnknown() ||
+		data.Tag.IsNull() || data.Tag.IsUnknown() {
+		return false
+	}
+	return rule.GetIdentifier() == data.Identifier.ValueString() &&
+		rule.GetRuleType().String() == data.RuleType.ValueString() &&
+		rule.GetTag() == data.Tag.ValueString()
+}
+
+func ruleIsNewer(candidate, current *apipb.Rule) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+
+	candidateCreated := candidate.GetCreatedAt()
+	currentCreated := current.GetCreatedAt()
+	if candidateCreated != nil || currentCreated != nil {
+		if candidateCreated == nil {
+			return false
+		}
+		if currentCreated == nil {
+			return true
+		}
+		candidateTime := candidateCreated.AsTime()
+		currentTime := currentCreated.AsTime()
+		if !candidateTime.Equal(currentTime) {
+			return candidateTime.After(currentTime)
+		}
+	}
+	return candidate.GetId() > current.GetId()
+}
+
+// selectManagedRule ignores Workshop REMOVE tombstones. Same-key upserts can
+// leave the prior ID readable as a tombstone, so prefer the newest active
+// logical match before falling back to an exact active state ID. The fallback
+// supports imports, where Terraform knows only the ID until the first read.
+func selectManagedRule(data RuleResourceModel, rules []*apipb.Rule) *apipb.Rule {
+	managedRules := filterManagedRules(rules)
+
+	var logicalMatch *apipb.Rule
+	for _, rule := range managedRules {
+		if ruleMatchesLogicalIdentity(data, rule) && ruleIsNewer(rule, logicalMatch) {
+			logicalMatch = rule
+		}
+	}
+	if logicalMatch != nil {
+		return logicalMatch
+	}
+
+	for _, rule := range managedRules {
+		if rule.GetRuleId() == data.Id.ValueString() {
+			return rule
+		}
+	}
+	return nil
+}
+
 func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var data RuleResourceModel
 
@@ -424,13 +503,21 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 
 	ret, err := r.client.ListRules(ctx, apipb.ListRulesRequest_builder{
 		Filter:   proto.String(filter),
-		PageSize: proto.Int32(1),
+		PageSize: proto.Int32(ruleReadCandidateLimit),
 	}.Build())
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Failed to list rules: %v", err))
 		return
 	}
-	if len(ret.GetRules()) == 0 {
+	if ret.GetMore() {
+		resp.Diagnostics.AddError(
+			"Client Error",
+			fmt.Sprintf("Rule lookup returned more than %d candidates; refusing to select from an incomplete result", ruleReadCandidateLimit),
+		)
+		return
+	}
+	rule := selectManagedRule(data, ret.GetRules())
+	if rule == nil {
 		// The rule was not found, remove it from the state so Terraform will offer
 		// to create it.
 		resp.State.RemoveResource(ctx)
@@ -439,7 +526,6 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 
 	// Now that we've found the rule, overwrite the state data with the actual
 	// values retrieved via the API.
-	rule := ret.GetRules()[0]
 	data.Id = types.StringValue(rule.GetRuleId())
 	data.Identifier = types.StringValue(rule.GetIdentifier())
 	data.RuleType = types.StringValue(rule.GetRuleType().String())
@@ -546,7 +632,7 @@ func NewRuleListResource() list.ListResource {
 
 func (r *RuleResource) ListResourceConfigSchema(ctx context.Context, req list.ListResourceSchemaRequest, resp *list.ListResourceSchemaResponse) {
 	resp.Schema = listschema.Schema{
-		Description: "List all rules in the Workshop instance.",
+		Description: "List all active rules in the Workshop instance. REMOVE tombstones are excluded.",
 		Attributes:  map[string]listschema.Attribute{},
 	}
 }
@@ -561,7 +647,7 @@ func (r *RuleResource) List(ctx context.Context, req list.ListRequest, stream *l
 			return
 		}
 
-		for _, rule := range ret.GetRules() {
+		for _, rule := range filterManagedRules(ret.GetRules()) {
 			result := req.NewListResult(ctx)
 			result.DisplayName = fmt.Sprintf("%s %s", rule.GetRuleType().String(), rule.GetIdentifier())
 
